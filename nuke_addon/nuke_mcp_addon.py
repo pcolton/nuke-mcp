@@ -1,8 +1,10 @@
 """NukeMCP Addon — Socket server running inside Nuke.
 
 This file runs inside Nuke's Python environment. It creates a TCP socket server
-that listens for JSON commands from the NukeMCP MCP server, executes them in
-Nuke's main thread, and returns structured JSON responses.
+that listens for JSON commands from NukeMCP MCP servers, executes them in
+Nuke's main thread, and returns structured JSON responses. Several MCP servers
+can be connected at once (say Claude Code, the Claude app and Codex), each on
+its own thread; Nuke runs their commands one at a time.
 
 No external dependencies beyond what Nuke ships with.
 
@@ -570,20 +572,40 @@ def _handle_list_annotations(params: dict) -> dict:
 
 
 
-_event_client_socket = None
-_event_socket_lock = threading.Lock()
+class _Client:
+    """One connected MCP server, such as one Claude Code or Codex session.
+
+    Responses come from the client's own thread and events from Nuke's main
+    thread, so sends share a lock to keep each message's line whole.
+    """
+
+    def __init__(self, sock: socket.socket, server):
+        self.sock = sock
+        self.server = server
+        self.events = set()  # Event types this client subscribed to
+        self._send_lock = threading.Lock()
+
+    def send_line(self, msg: str):
+        with self._send_lock:
+            self.sock.sendall(msg.encode("utf-8"))
+
+
+_clients = set()
+_clients_lock = threading.Lock()
 _registered_callbacks = set()
 
 
 def _push_event(event_type: str, data: dict):
-    """Push an event to the connected MCP client."""
-    if _event_client_socket is None:
+    """Push an event to each connected MCP client that subscribed to it."""
+    with _clients_lock:
+        targets = [c for c in _clients if event_type in c.events]
+    if not targets:
         return
     event = {"type": "event", "event_type": event_type, "data": data}
     msg = json.dumps(event) + "\n"
-    with _event_socket_lock:
+    for client in targets:
         try:
-            _event_client_socket.sendall(msg.encode("utf-8"))
+            client.send_line(msg)
         except OSError:
             pass
 
@@ -757,6 +779,14 @@ class NukeMCPServer:
             except OSError:
                 pass
             self._server_sock = None
+        # Wake each client thread blocked in recv() so it closes its socket.
+        with _clients_lock:
+            mine = [c for c in _clients if c.server is self]
+        for client in mine:
+            try:
+                client.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         log.info("NukeMCP server stopped")
 
     def _serve(self):
@@ -764,20 +794,20 @@ class NukeMCPServer:
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.settimeout(1.0)
         self._server_sock.bind(("127.0.0.1", self.port))
-        self._server_sock.listen(1)
+        self._server_sock.listen(8)
         self._emit_log(f"Listening on port {self.port}")
 
+        # Each client gets its own thread, so several MCP servers (Claude Code,
+        # the Claude app, Codex) can use one Nuke at once. Nuke still runs
+        # their commands one at a time, on its main thread.
         while self._running:
             try:
-                client, addr = self._server_sock.accept()
+                sock, addr = self._server_sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-
-            self._emit_log(f"Client connected from {addr[0]}:{addr[1]}")
-            self._handle_client(client)
-            self._emit_log("Client disconnected")
+            threading.Thread(target=self._handle_client, args=(sock, addr), daemon=True).start()
 
     def _run_in_nuke(self, func, *args):
         """Call func in Nuke's main thread (GUI) or via queue (headless)."""
@@ -808,25 +838,41 @@ class NukeMCPServer:
             return result
         return func(*args)
 
-    def _handle_client(self, client: socket.socket):
-        global _event_client_socket
-        client.settimeout(None)
-        _event_client_socket = client
-
-        # Send handshake
-        handshake = self._run_in_nuke(_handshake_data)
-        if not isinstance(handshake, dict):
+    def _handle_client(self, sock: socket.socket, addr=None):
+        sock.settimeout(None)
+        client = _Client(sock, self)
+        where = f"{addr[0]}:{addr[1]}" if addr else "a client"
+        try:
             try:
-                client.close()
+                handshake = self._run_in_nuke(_handshake_data)
+            except Exception as e:
+                self._emit_log(f"Handshake with {where} failed: {type(e).__name__}: {e}")
+                return
+            if not isinstance(handshake, dict):
+                return
+            with _clients_lock:
+                _clients.add(client)
+                count = len(_clients)
+            self._emit_log(f"Client connected from {where} ({count} connected)")
+            self._send(client, handshake)
+            self._serve_client(client)
+        finally:
+            with _clients_lock:
+                known = client in _clients
+                _clients.discard(client)
+                count = len(_clients)
+            try:
+                sock.close()
             except OSError:
                 pass
-            return
-        self._send(client, handshake)
+            if known:
+                self._emit_log(f"Client {where} disconnected ({count} connected)")
 
+    def _serve_client(self, client: _Client):
         buffer = b""
         while self._running:
             try:
-                chunk = client.recv(1024 * 1024)
+                chunk = client.sock.recv(1024 * 1024)
             except OSError:
                 break
             if not chunk:
@@ -853,17 +899,14 @@ class NukeMCPServer:
                         response = self._run_in_nuke(handler, params)
                     except Exception as e:
                         response = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+                    if cmd_type == "subscribe_events" and response.get("status") == "ok":
+                        # Nuke's callbacks are shared; each client gets only the events it asked for.
+                        client.events.update(params.get("event_types") or [])
 
                 self._send(client, response)
                 self._emit_log(f"-> {response.get('status', '?')}")
 
-        _event_client_socket = None
-        try:
-            client.close()
-        except OSError:
-            pass
-
-    def _send(self, client: socket.socket, data: dict):
+    def _send(self, client: _Client, data: dict):
         try:
             msg = json.dumps(data) + "\n"
         except (TypeError, ValueError) as e:
@@ -872,7 +915,7 @@ class NukeMCPServer:
             error = {"status": "error", "error": f"Could not encode the response: {e}"}
             msg = json.dumps(error) + "\n"
         try:
-            client.sendall(msg.encode("utf-8"))
+            client.send_line(msg)
         except OSError:
             pass
 
