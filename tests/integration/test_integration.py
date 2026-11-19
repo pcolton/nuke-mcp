@@ -22,6 +22,10 @@ def test_get_script_info(integration_conn):
     assert "frame_range" in result
     assert "fps" in result
     assert "node_count" in result
+    # "width height" with an optional name, not a Python object repr
+    width, height = result["format"].split()[:2]
+    assert int(width) > 0
+    assert int(height) > 0
 
 
 def test_create_and_delete_node(integration_conn):
@@ -116,3 +120,23 @@ def test_version_gating(integration_conn):
     assert conn.handshake is not None
     assert "nuke_version" in conn.handshake
     assert "variant" in conn.handshake
+
+
+def test_get_node_info_with_format_knob(integration_conn):
+    """A format knob returns a nuke.Format, which json cannot encode as it is."""
+    conn = integration_conn
+    resp = conn.send({
+        "type": "create_node",
+        "params": {"node_class": "Reformat", "name": "test_reformat"},
+    })
+    assert resp["status"] == "ok"
+
+    resp = conn.send({"type": "get_node_info", "params": {"node_name": "test_reformat"}})
+    assert resp["status"] == "ok"
+    assert isinstance(resp["result"]["knobs"]["format"], str)
+
+    # The addon still answers afterwards
+    resp = conn.send({"type": "ping", "params": {}})
+    assert resp["status"] == "ok"
+
+    conn.send({"type": "delete_node", "params": {"node_name": "test_reformat", "confirm": True}})

@@ -81,6 +81,31 @@ def _handle_ping(params: dict) -> dict:
     return {"status": "ok", "result": "pong"}
 
 
+def _format_string(fmt) -> str:
+    """Describe a nuke.Format as "width height name", e.g. "1920 1080 HD_1080".
+
+    str() on a Format gives the Python object repr, which says nothing about it.
+    The name is left off for formats that have none.
+    """
+    text = f"{fmt.width()} {fmt.height()}"
+    name = fmt.name()
+    return f"{text} {name}" if name else text
+
+
+def _json_safe(value):
+    """Return value if json can encode it, otherwise a string describing it.
+
+    Some knobs return Nuke objects. A format knob returns a nuke.Format, for example.
+    """
+    if isinstance(value, _get_nuke().Format):
+        return _format_string(value)
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
+
+
 def _handle_get_script_info(params: dict) -> dict:
     nuke = _get_nuke()
     root = nuke.root()
@@ -90,7 +115,7 @@ def _handle_get_script_info(params: dict) -> dict:
             "name": root.name(),
             "frame_range": [root["first_frame"].value(), root["last_frame"].value()],
             "fps": root["fps"].value(),
-            "format": str(root.format()),
+            "format": _format_string(root.format()),
             "colorspace": root["colorManagement"].value(),
             "node_count": len(nuke.allNodes()),
         },
@@ -107,7 +132,7 @@ def _handle_get_node_info(params: dict) -> dict:
     knobs = {}
     for knob_name in node.knobs():
         try:
-            knobs[knob_name] = node[knob_name].value()
+            knobs[knob_name] = _json_safe(node[knob_name].value())
         except Exception:
             knobs[knob_name] = str(node[knob_name])
 
@@ -758,7 +783,22 @@ class NukeMCPServer:
         """Call func in Nuke's main thread (GUI) or via queue (headless)."""
         nuke = _get_nuke()
         if nuke.GUI:
-            return nuke.executeInMainThread(func, args=args)
+            # executeInMainThread returns at once with no result, so wait for
+            # the result. executeInMainThreadWithResult prints an exception and
+            # returns None, so carry the exception back to this thread instead.
+            def call():
+                try:
+                    return True, func(*args)
+                except Exception as e:
+                    return False, e
+
+            outcome = nuke.executeInMainThreadWithResult(call)
+            if outcome is None:
+                raise RuntimeError("Nuke returned no result from its main thread")
+            succeeded, value = outcome
+            if not succeeded:
+                raise value
+            return value
         if self._main_queue is not None:
             result_q = queue.Queue()
             self._main_queue.put((func, args, result_q))
@@ -824,7 +864,13 @@ class NukeMCPServer:
             pass
 
     def _send(self, client: socket.socket, data: dict):
-        msg = json.dumps(data) + "\n"
+        try:
+            msg = json.dumps(data) + "\n"
+        except (TypeError, ValueError) as e:
+            # An unencodable value must not kill the listener thread: the client
+            # would wait forever and no later command would be answered.
+            error = {"status": "error", "error": f"Could not encode the response: {e}"}
+            msg = json.dumps(error) + "\n"
         try:
             client.sendall(msg.encode("utf-8"))
         except OSError:
