@@ -49,6 +49,15 @@ class EventLog:
         self.events.clear()
 
 
+def resubscribe(conn, event_log: EventLog):
+    """Ask the addon again for the subscribed events.
+
+    Run after a reconnect: a restarted Nuke has no event callbacks registered.
+    """
+    if event_log.subscriptions:
+        conn.send_command("subscribe_events", {"event_types": list(event_log.subscriptions)})
+
+
 def register(server: NukeMCPServer):
     mcp = server.mcp
     conn = server.connection
@@ -57,6 +66,7 @@ def register(server: NukeMCPServer):
 
     # Wire up the connection's event handler to populate the EventLog
     conn.set_event_handler(lambda msg: event_log.add(msg))
+    conn.add_reconnect_handler(lambda: resubscribe(conn, event_log))
 
     @mcp.tool()
     def subscribe_events(event_types: list[str] | None = None) -> dict:

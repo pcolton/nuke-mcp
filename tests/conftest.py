@@ -33,3 +33,23 @@ def connection(mock_server, mock_port):
     conn.connect()
     yield conn
     conn.disconnect()
+
+
+@pytest.fixture
+def quit_nuke(mock_server, connection):
+    """Return a function that stops the mock, as when Nuke quits.
+
+    It returns once the connection has noticed. Call mock_server.start() afterwards
+    to bring "Nuke" back on the same port.
+    """
+    import time
+
+    def quit_nuke():
+        mock_server.stop()
+        mock_server._thread.join(timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while connection.is_connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not connection.is_connected
+
+    return quit_nuke

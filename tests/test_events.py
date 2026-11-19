@@ -89,3 +89,66 @@ def test_event_push_received(mock_server, mock_port):
     assert received[0]["data"]["name"] == "Grade1"
 
     conn.disconnect()
+
+
+def test_resubscribe_restores_subscriptions(connection, mock_server):
+    from nukemcp.events import resubscribe
+
+    log = EventLog()
+    log.subscribe(["node_created", "node_deleted"])
+    mock_server.state._subscribed_events = []  # a restarted Nuke has none
+
+    resubscribe(connection, log)
+
+    assert set(mock_server.state._subscribed_events) == {"node_created", "node_deleted"}
+
+
+def test_resubscribe_sends_nothing_without_subscriptions(connection, mock_server):
+    from nukemcp.events import resubscribe
+
+    mock_server.state._subscribed_events = ["untouched"]
+    resubscribe(connection, EventLog())
+    assert mock_server.state._subscribed_events == ["untouched"]
+
+
+def test_server_resubscribes_after_reconnect(monkeypatch):
+    """The built server restores event subscriptions when Nuke comes back."""
+    import socket
+    import time
+
+    from nukemcp import server as server_module
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    # build_server returns only the FastMCP object, so catch the server it builds
+    built = {}
+
+    class Capturing(server_module.NukeMCPServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built["server"] = self
+
+    monkeypatch.setattr(server_module, "NukeMCPServer", Capturing)
+    server_module.build_server(port=port, mock=True)
+
+    server = built["server"]
+    conn, mock = server.connection, server._mock_server
+    try:
+        server.event_log.subscribe(["node_created"])
+        conn.send_command("subscribe_events", {"event_types": ["node_created"]})
+
+        mock.stop()
+        mock._thread.join(timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while conn.is_connected and time.monotonic() < deadline:
+            time.sleep(0.01)
+        mock.state._subscribed_events = []
+        mock.start()
+
+        conn.send_command("ping")
+        assert mock.state._subscribed_events == ["node_created"]
+    finally:
+        conn.disconnect()
+        mock.stop()

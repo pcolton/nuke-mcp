@@ -441,6 +441,13 @@ class MockNukeServer:
                 self._server_sock.close()
             except OSError:
                 pass
+        # Drop the connected client too, as Nuke does when it quits
+        client = self._client_socket
+        if client:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def _serve(self):
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
